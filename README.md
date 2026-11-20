@@ -613,6 +613,57 @@ For example: merging JSON and YAML will most likely fail because JSON treats int
 - Config keys are case-sensitive in koanf. For example, `app.server.port` and `APP.SERVER.port` are not the same.
 - koanf does not impose any ordering on loading config from various providers. Every successive `Load()` or `Merge()` merges new config into the existing config. That is, it is possible to load environment variables first, then files on top of it, and then command line variables on top of it, or any such order.
 
+### Transactional reload of multiple sources
+
+A hot-reload loop that calls `Load()` once per provider makes each provider's
+values visible immediately, so a later provider failing leaves the service
+running on a mix of old and new config. `Reload()` builds the whole
+configuration in a private candidate first and publishes it atomically only
+after every provider was read, parsed and merged successfully. `Load()` keeps
+its existing behaviour.
+
+```go
+res, err := k.Reload(ctx, []koanf.Source{
+	{Name: "defaults", Provider: confmap.Provider(defaults, ".")},
+	{Name: "file", Provider: file.Provider("config.yml"), Parser: yaml.Parser()},
+	{Name: "env", Provider: env.Provider(".", env.Opt{})},
+}, koanf.WithGeneration(nextGen))
+if err != nil {
+	var re *koanf.ReloadError
+	if errors.As(err, &re) {
+		// re.Source, re.Key (when merging failed) and re.Err identify what broke.
+	}
+	// The previously published configuration is still intact.
+	return err
+}
+
+// Reads are always consistent with a single generation.
+src, _ := k.SourceOf("db.host") // "file"
+snap := k.Snapshot()            // one consistent generation
+```
+
+Key properties:
+
+- Sources are applied in declaration order; a later source overrides an earlier
+  one, just like successive `Load()` calls. With `StrictMerge`, a type conflict
+  aborts the reload and is reported with the source, the key path and the
+  underlying error.
+- Readers see either the complete old configuration or the complete new one.
+  `Snapshot()` returns raw/flat/key-map/provenance from one generation.
+- The source of every key's final value is recorded. `SourceOf()` and
+  `KeySources()` expose it. A plain `Load()`, `Merge()`, `Set()` or `Delete()`
+  invalidates it because those mutate outside a transactional publish.
+- Generations order candidates: a candidate older than the published one is
+  discarded with `ErrStaleReload`, and republishing the current generation is
+  an idempotent no-op. A canceled reload never publishes.
+- `OnReload()` callbacks run only after publishing, and each changed key is
+  reported exactly once, sorted by key.
+- By default the candidate is rebuilt from the declared sources only, so keys
+  no source supplies are removed. Use `WithRetainExisting()` to merge the
+  sources on top of the published config instead.
+- `Rollback(gen)` atomically restores a retained generation as a new, higher
+  generation. Rolling back to the current content is a no-op.
+
 ### Custom Providers and Parsers
 
 A Provider returns a nested `map[string]any` config that can be loaded directly into koanf with `koanf.Load()` or it can return raw bytes that can be parsed with a Parser (again, loaded using `koanf.Load()`. Writing Providers and Parsers are easy. See the bundled implementations in the [providers](https://github.com/knadh/koanf/tree/master/providers) and [parsers](https://github.com/knadh/koanf/tree/master/parsers) directories.

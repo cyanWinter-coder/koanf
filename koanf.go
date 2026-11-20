@@ -25,6 +25,34 @@ type Koanf struct {
 	keyMap      KeyMap
 	conf        Conf
 	mu          sync.RWMutex
+
+	// Transactional reload state. See reload.go.
+
+	// keySources maps flattened keys to the source that supplied their final
+	// value in the last published transactional reload. It is nil until the
+	// first successful Reload and is cleared by any non-transactional
+	// mutation (Load, Merge, Set, Delete).
+	keySources map[string]string
+
+	// sourceNames records the declared source order of the last published
+	// transactional reload.
+	sourceNames []string
+
+	// generation is the generation of the published configuration and
+	// nextGeneration is the highest generation handed out so far. Both are
+	// guarded by mu.
+	generation     uint64
+	nextGeneration uint64
+
+	// history stores deep copies of recently published transactional states,
+	// keyed by generation, for Rollback. It is cleared by non-transactional
+	// mutations, which break the linear generation history.
+	history map[uint64]*publishedState
+
+	// reloadCallbacks holds OnReload callbacks. Callbacks are copied under the
+	// lock and invoked after it is released.
+	reloadCallbacks map[uint64]func(ReloadResult)
+	nextCallbackID  uint64
 }
 
 // Conf is the Koanf configuration.
@@ -317,6 +345,7 @@ func (ko *Koanf) Delete(path string) {
 		ko.confMap = make(map[string]any)
 		ko.confMapFlat = make(map[string]any)
 		ko.keyMap = make(KeyMap)
+		ko.invalidateReloadStateLocked()
 		return
 	}
 
@@ -326,6 +355,7 @@ func (ko *Koanf) Delete(path string) {
 		return
 	}
 	maps.Delete(ko.confMap, p)
+	ko.invalidateReloadStateLocked()
 
 	// Update the flattened version as well.
 	ko.confMapFlat, ko.keyMap = maps.Flatten(ko.confMap, nil, ko.conf.Delim)
@@ -475,6 +505,11 @@ func (ko *Koanf) merge(c map[string]any, opts *options) error {
 	} else {
 		maps.Merge(c, ko.confMap)
 	}
+
+	// A non-transactional mutation breaks the linear transactional history,
+	// so the per-key provenance and rollback snapshots no longer describe the
+	// live configuration.
+	ko.invalidateReloadStateLocked()
 
 	// Maintain a flattened version as well.
 	ko.confMapFlat, ko.keyMap = maps.Flatten(ko.confMap, nil, ko.conf.Delim)
